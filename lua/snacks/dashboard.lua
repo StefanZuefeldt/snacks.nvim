@@ -1271,7 +1271,7 @@ function M.setup()
   end
 
   local options = { showtabline = vim.o.showtabline, laststatus = vim.o.laststatus }
-  vim.o.showtabline, vim.o.laststatus = 0, 0
+--  vim.o.showtabline, vim.o.laststatus = 0, 0
   local dashboard = M.open({ buf = buf, win = wins[1] })
   D.on("Closed", function()
     for k, v in pairs(options) do
