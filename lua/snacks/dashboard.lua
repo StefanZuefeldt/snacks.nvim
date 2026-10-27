@@ -24,6 +24,11 @@ math.randomseed(os.time())
 --- * if it's a string, it will be executed as a keymap
 --- * if it's a function, it will be called
 ---@field action? snacks.dashboard.Action
+--- Extra keymaps that act on the item under the cursor, keyed by lhs.
+--- Inherited from parent sections and merged per lhs (the item's own win, `false` removes one).
+--- When the cursor item has no action for the lhs, an item whose `key` is that lhs runs instead.
+---@field actions? table<string, snacks.dashboard.ItemAction|snacks.dashboard.ItemAction.fn|string|true|false>
+---@field id? any stable identity, used to keep the cursor on the item when the dashboard updates
 ---@field enabled? boolean|fun(opts:snacks.dashboard.Opts):boolean if false, the section will be disabled
 ---@field section? string the name of a section to include. See `Snacks.dashboard.sections`
 ---@field [string] any section options
@@ -44,6 +49,11 @@ math.randomseed(os.time())
 ---@alias snacks.dashboard.Format.function fun(item:snacks.dashboard.Item, ctx:snacks.dashboard.Format.ctx):snacks.dashboard.Text>
 ---@alias snacks.dashboard.Format.ctx {width?:number, dashboard:snacks.dashboard.Class}
 ---@alias snacks.dashboard.Action string|fun(self:snacks.dashboard.Class)
+---@alias snacks.dashboard.ItemAction.fn fun(self:snacks.dashboard.Class, item:snacks.dashboard.Item)
+
+---@class snacks.dashboard.ItemAction
+---@field [1] snacks.dashboard.ItemAction.fn|string|true called with the cursor item; a string works like `action` (`:cmd` or keys); `true` runs the item's `action`
+---@field desc? string keymap description
 ---@alias snacks.dashboard.Gen fun(self:snacks.dashboard.Class):snacks.dashboard.Section?
 ---@alias snacks.dashboard.Section snacks.dashboard.Item|snacks.dashboard.Gen|snacks.dashboard.Section[]
 
@@ -250,6 +260,7 @@ Snacks.util.set_hl(links, { prefix = "SnacksDashboard", default = true })
 ---@field format_keys snacks.dashboard.FormatKeys
 ---@field templates table<string, snacks.dashboard.Template>
 ---@field items snacks.dashboard.Item[]
+---@field keymaps? table<string, string> lhs set by the last `D:keys()`, by normalized lhs
 ---@field row? number
 ---@field col? number
 ---@field panes? snacks.dashboard.Item[][]
@@ -528,6 +539,28 @@ function D:enabled(item)
   return e == nil or e
 end
 
+-- Normalize a lhs, so `<c-x>` and `<C-X>` are the same key
+---@param lhs string
+local keyids = {} ---@type table<string, string>
+local function keyid(lhs)
+  keyids[lhs] = keyids[lhs] or vim.fn.keytrans(Snacks.util.keycode(lhs))
+  return keyids[lhs]
+end
+
+-- Items the cursor can land on: a primary `action`, or at least one cursor action
+---@param item snacks.dashboard.Item
+local function actionable(item)
+  if item.action then
+    return true
+  end
+  for _, a in pairs(item.actions or {}) do
+    if a then
+      return true
+    end
+  end
+  return false
+end
+
 ---@param item snacks.dashboard.Section?
 ---@param results? snacks.dashboard.Item[]
 ---@param parent? snacks.dashboard.Item
@@ -542,6 +575,15 @@ function D:resolve(item, results, parent)
   if type(item) == "table" and parent then -- inherit parent properties
     for _, prop in ipairs({ "indent", "align", "pane" }) do
       item[prop] = item[prop] or parent[prop]
+    end
+    if parent.actions then -- merge per normalized lhs, the item's own actions win
+      local actions = {}
+      for _, from in ipairs({ parent.actions, item.actions or {} }) do
+        for lhs, a in pairs(from) do
+          actions[keyid(lhs)] = a
+        end
+      end
+      item.actions = actions
     end
   end
 
@@ -644,7 +686,7 @@ function D:find(pos, from)
 
   local ret ---@type snacks.dashboard.Item?
   for _, item in ipairs(self.items) do
-    if item._ and item._.pane == pane and item.action then
+    if item._ and item._.pane == pane and actionable(item) then
       if ret and pos[1] < from[1] and item._.row > pos[1] then
         break
       end
@@ -655,6 +697,27 @@ function D:find(pos, from)
     end
   end
   return ret
+end
+
+--- Put the cursor on the rendered item with the given `id`,
+--- or on the item under the cursor when `id` is `nil`
+---@param id? any
+---@return snacks.dashboard.Item? item the focused item
+function D:focus(id)
+  local item ---@type snacks.dashboard.Item?
+  if id == nil then
+    item = self:find(vim.api.nvim_win_get_cursor(self.win))
+  else
+    item = vim.tbl_filter(function(it)
+      return it.id == id and actionable(it) and it._ and not it.hidden
+    end, self.items)[1]
+  end
+  if item then
+    local col = self.lines[item._.row]:find("[%w%d%p]", item._.col + 1)
+    col = col or (item._.col + 1 + (item.indent and (item.indent + 1) or 0))
+    vim.api.nvim_win_set_cursor(self.win, { item._.row, col - 1 })
+  end
+  return item
 end
 
 -- Layout in panes
@@ -670,7 +733,8 @@ function D:layout()
       table.insert(self.panes[pane], item)
     end
   end
-  for p = 1, math.max(unpack(vim.tbl_keys(self.panes))) or 1 do
+  -- math.max() with no arguments errors, so seed it for a render with no visible items
+  for p = 1, math.max(1, unpack(vim.tbl_keys(self.panes))) do
     self.panes[p] = self.panes[p] or {}
   end
 end
@@ -747,23 +811,90 @@ function D:render_buf(extmarks)
   end
 end
 
+---@param item snacks.dashboard.Item
+---@param id string normalized lhs
+---@return snacks.dashboard.ItemAction.fn|true|nil
+local function item_action(item, id)
+  for lhs, a in pairs(item.actions or {}) do
+    if a and keyid(lhs) == id then
+      return type(a) == "table" and a[1] or a
+    end
+  end
+end
+
+---Runs the cursor action `item` binds to `id`
+---@param item snacks.dashboard.Item
+---@param id string normalized lhs
+---@return boolean handled false when the item has no action for `id`
+function D:run_item_action(item, id)
+  local fn = item_action(item, id)
+  if fn == true then
+    if item.action then
+      self:action(item.action)
+    end
+  elseif type(fn) == "string" then
+    self:action(fn)
+  elseif fn then
+    fn(self, item)
+  else
+    return false
+  end
+  return true
+end
+
 function D:keys()
   local autokeys = self.opts.autokeys:gsub("[hjklq]", "")
+  local actions = {} ---@type table<string, {lhs:string, desc?:string, item?:snacks.dashboard.Item}>
   for _, item in ipairs(self.items) do
     if item.key and not item.autokey then
       autokeys = autokeys:gsub(vim.pesc(item.key), "", 1)
     end
+    for lhs, a in pairs(item.actions or {}) do
+      if a then
+        local id = keyid(lhs)
+        actions[id] = actions[id] or { lhs = lhs, desc = type(a) == "table" and a.desc or nil }
+        if #lhs == 1 then
+          autokeys = autokeys:gsub(vim.pesc(lhs), "", 1)
+        end
+      end
+    end
   end
+  local keymaps = {} ---@type table<string, string>
   for _, item in ipairs(self.items) do
     if item.autokey then
       item.key, autokeys = autokeys:sub(1, 1), autokeys:sub(2)
     end
-    if item.key then
+    if item.key and actions[keyid(item.key)] then -- shares the cursor action keymap below
+      actions[keyid(item.key)].item = item
+    elseif item.key then
+      keymaps[keyid(item.key)] = item.key
       vim.keymap.set("n", item.key, function()
         self:action(item.action)
       end, { buffer = self.buf, nowait = not item.autokey, desc = "Dashboard action" })
     end
   end
+  -- one keymap per lhs, acting on the item under the cursor, else on the item with that `key`
+  for id, a in pairs(actions) do
+    if id ~= "<CR>" then -- `D:update` owns <cr> and dispatches <cr> actions itself
+      keymaps[id] = a.lhs
+      vim.keymap.set("n", a.lhs, function()
+        local item = self:find(vim.api.nvim_win_get_cursor(self.win))
+        if not (item and self:run_item_action(item, id)) and a.item then
+          self:action(a.item.action)
+        end
+      end, { buffer = self.buf, nowait = true, desc = "Dashboard: " .. (a.desc or "item action") })
+    end
+  end
+  -- unbind keys of the previous render that are no longer used
+  for id, lhs in pairs(self.keymaps or {}) do
+    if not keymaps[id] then
+      pcall(vim.keymap.del, "n", lhs, { buffer = self.buf })
+      if id == "q" or (id == "<Esc>" and self:is_float()) then -- restore the default from `D:init`
+        vim.keymap.set("n", lhs, "<cmd>bd<cr>", { silent = true, buffer = self.buf })
+      end
+    end
+  end
+  self.keymaps = keymaps
 end
 
 ---@param opts snacks.dashboard.Opts
@@ -814,20 +945,31 @@ function D:update()
     right = self:get_formatters(self.formats, "right")
   }
 
+  -- the item under the cursor, to keep the cursor on it by `id` after rendering
+  local focus ---@type any
+  if self.lines and vim.api.nvim_win_get_buf(self.win) == self.buf then
+    focus = (self:find(vim.api.nvim_win_get_cursor(self.win)) or {}).id
+  end
+
   self.items = self:resolve(self.opts.sections)
 
   self:layout()
   self:keys()
   self:render()
 
-  -- actions on enter
+  -- actions on enter: the item's own <cr> action, else its primary action
   vim.keymap.set("n", "<cr>", function()
     local item = self:find(vim.api.nvim_win_get_cursor(self.win))
-    return item and item.action and self:action(item.action)
+    if item and not self:run_item_action(item, "<CR>") and item.action then
+      self:action(item.action)
+    end
   end, { buffer = self.buf, nowait = true, desc = "Dashboard action" })
 
+  -- refocus the item, or the item nearest its old row when it's gone
+  local focused = focus ~= nil and (self:focus(focus) or self:focus())
+
   -- cursor movement
-  local last = { 1, 0 }
+  local last = focused and vim.api.nvim_win_get_cursor(self.win) or { 1, 0 }
   vim.api.nvim_create_autocmd("CursorMoved", {
     group = vim.api.nvim_create_augroup("snacks_dashboard_cursor", { clear = true }),
     buffer = self.buf,
@@ -835,7 +977,7 @@ function D:update()
       local item = self:find(vim.api.nvim_win_get_cursor(self.win), last)
       -- can happen for panes without actionable items
       item = item or vim.tbl_filter(function(it)
-        return it.action and it._
+        return actionable(it) and it._
       end, self.items)[1]
       if item then
         local col = self.lines[item._.row]:find("[%w%d%p]", item._.col + 1)
